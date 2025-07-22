@@ -1,5 +1,4 @@
 torch>=2.0
-transformers>=4.40
 pandas
 scikit-learn
 numpy
@@ -7,3 +6,6 @@ fastapi
 uvicorn
 streamlit
 openpyxl
+jieba
+onnxruntime>=1.18
+onnx
