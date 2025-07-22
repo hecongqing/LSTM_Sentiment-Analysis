@@ -13,10 +13,14 @@ from typing import List
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from torch.nn import functional as F
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from torch.nn import functional as F  # kept for softmax
+import jieba
+import numpy as np
+import onnxruntime as ort
+from torch.nn.utils.rnn import pad_sequence
 
-MODEL_DIR = Path("checkpoints/bert")  # default path, override via env if needed
+MODEL_DIR = Path("checkpoints/rnn")  # default path, override via env if needed
+MAX_LEN = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 app = FastAPI(title="SMP2020 Emotion API", version="1.0")
@@ -36,36 +40,42 @@ class PredOut(BaseModel):
 
 @app.on_event("startup")
 def load_model():
-    """Load model into global state."""
-    global tokenizer, model, id2label
+    """Load ONNX session, vocab, and label mapping into app state."""
+    global session, input_name, word2idx, id2label
 
     if not MODEL_DIR.exists():
         raise RuntimeError("Model directory not found. Train the model first.")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-    model.to(DEVICE).eval()
+    # ONNX session (CPU/gpu if available)
+    session = ort.InferenceSession(str(MODEL_DIR / "model.onnx"))
+    input_name = session.get_inputs()[0].name
 
+    # Vocabulary
+    with open(MODEL_DIR / "vocab.json", "r", encoding="utf-8") as f:
+        word2idx = json.load(f)
+
+    # Label mapping
     with open(MODEL_DIR / "label_mapping.json", "r", encoding="utf-8") as f:
         mapping = json.load(f)["id2label"]
     id2label = {int(k): v for k, v in mapping.items()}
+
+
+def _encode(text: str) -> torch.Tensor:
+    ids = [word2idx.get(tok, 1) for tok in jieba.lcut(text)][:MAX_LEN]
+    return torch.tensor(ids, dtype=torch.long)
 
 
 @app.post("/predict", response_model=PredOut)
 def predict(payload: TextIn):
     if not payload.texts:
         raise HTTPException(status_code=400, detail="No texts provided")
-    enc = tokenizer(
-        payload.texts,
-        padding=True,
-        truncation=True,
-        max_length=128,
-        return_tensors="pt",
-    ).to(DEVICE)
-    with torch.no_grad():
-        logits = model(**enc).logits
-        probs = F.softmax(logits, dim=-1)
-        preds = probs.argmax(dim=-1).cpu().tolist()
-        probs = probs.cpu().tolist()
+
+    encoded = [_encode(t) for t in payload.texts]
+    batch = pad_sequence(encoded, batch_first=True, padding_value=0)
+    ort_inputs = {input_name: batch.numpy()}
+    logits = session.run(None, ort_inputs)[0]
+    probs = torch.softmax(torch.from_numpy(logits), dim=-1)
+    preds = probs.argmax(dim=-1).tolist()
+    probs = probs.tolist()
     labels = [id2label[p] for p in preds]
     return PredOut(labels=labels, probs=probs)
